@@ -19,7 +19,7 @@ type Server struct {
 	cfg      *config.Config
 	accounts *accounts.Manager
 	tokens   *APIKeyAuth
-	upstream *Upstream
+	chat     func(context.Context, *Session, ChatInput, EventFunc) (ChatResult, error)
 	sessions *conversationStore
 }
 
@@ -28,7 +28,7 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		cfg:      cfg,
 		accounts: mgr,
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
-		upstream: NewUpstream(cfg),
+		chat:     NewUpstream(cfg).Chat,
 		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256),
 	}
 }
@@ -158,8 +158,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	model := s.mapModel(req.Model)
 	allowedTools := requestedToolNames(&req)
 	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
-	if choiceMode == "function" && choiceName != "" {
-		allowedTools[choiceName] = true
+	if choiceMode == "function" && !allowedTools[choiceName] {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tool_choice names an undeclared tool")
+		return
 	}
 	parallelTools := true
 	if req.ParallelToolCalls != nil {
@@ -229,17 +230,55 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		in.CreateSession = true
 		in.Prompt = prompt
 	}
-	responseOutput := func(result ChatResult) (string, []ToolCall) {
-		text := result.Text
-		var replies []ToolCallReply
-		if bridgeActive {
-			text, replies = parseClientToolCalls(text, allowedTools)
-			if len(replies) == 0 {
-				replies = nativeToolReplies(result.ToolCalls, allowedTools)
-			}
-			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
+	bridgedAllowed := func() map[string]bool {
+		if choiceMode == "function" {
+			return map[string]bool{choiceName: true}
 		}
-		return text, replyToolCalls(replies)
+		return allowedTools
+	}
+	hasToolOutput := func(result ChatResult) bool {
+		if !bridgeActive {
+			return false
+		}
+		_, calls, err := resolveToolCalls(result, bridgedAllowed(), choiceMode, choiceName, parallelTools)
+		if err != nil {
+			// 交给 finishTools 修复或返回 invalid_tool_call。
+			return true
+		}
+		return len(calls) > 0
+	}
+	finishTools := func(result *ChatResult) (string, []ToolCall, error) {
+		text, calls, err := resolveToolCalls(*result, bridgedAllowed(), choiceMode, choiceName, parallelTools)
+		if !errors.Is(err, errToolMarker) || ctx.Err() != nil {
+			return text, calls, err
+		}
+		conv.reset()
+		repair := ChatInput{
+			Model:         in.Model,
+			ChatAgentID:   in.ChatAgentID,
+			CreateSession: true,
+			DeleteSession: true,
+			SystemPrompt:  in.SystemPrompt + "\nReformat the rejected draft. Preserve argument values. Do not execute the task.",
+			Title:         "Format client tool call",
+			Prompt:        rawArgumentRepair + "\nRejected draft:\n" + result.Text,
+		}
+		fixed, repairErr := s.chat(ctx, SessionFromAccount(usedAccount, s.cfg), repair, nil)
+		if repairErr != nil {
+			return "", nil, repairErr
+		}
+		result.Usage.add(fixed.Usage)
+		text, calls, err = repairedToolCalls(fixed, bridgedAllowed(), choiceMode, choiceName, parallelTools)
+		if err == nil && len(calls) == 0 {
+			err = errToolMarker
+		}
+		return text, calls, err
+	}
+	writeToolError := func(err error) {
+		code := "upstream_error"
+		if errors.Is(err, errToolMarker) {
+			code = "invalid_tool_call"
+		}
+		writeOpenAIError(w, http.StatusBadGateway, code, err.Error())
 	}
 	blockedAccounts := make(map[int64]bool)
 	attemptedAccounts := make(map[int64]bool)
@@ -326,13 +365,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			attempts++
 			log.Printf("chat %s attempt=%d/%d account=%s", id, attempts, maxAttempts, accountLogLabel(acct))
 			attemptStarted := time.Now()
-			res, err = s.upstream.Chat(ctx, sess, in, onEvent)
+			res, err = s.chat(ctx, sess, in, onEvent)
 			attemptDuration := time.Since(attemptStarted)
-			if err == nil {
-				text, toolCalls := responseOutput(res)
-				if !hasVisibleText(text) && len(toolCalls) == 0 {
-					err = fmt.Errorf("%w (completion_tokens=%d)", ErrEmptyResponse, res.Usage.CompletionTokens)
-				}
+			if err == nil && !hasVisibleText(res.Text) && !hasToolOutput(res) {
+				err = fmt.Errorf("%w (completion_tokens=%d)", ErrEmptyResponse, res.Usage.CompletionTokens)
 			}
 			s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
 				Duration:         attemptDuration,
@@ -408,7 +444,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			conv.messages = append([]Message(nil), req.Messages...)
 			conv.systemPrompt = systemPromptText
 		}
-		text, toolCalls := responseOutput(res)
+		text := res.Text
+		var toolCalls []ToolCall
+		if bridgeActive {
+			var ferr error
+			text, toolCalls, ferr = finishTools(&res)
+			if ferr != nil {
+				conv.reset()
+				writeToolError(ferr)
+				return
+			}
+		}
 		message := map[string]any{"role": "assistant"}
 		if !hasVisibleText(text) {
 			message["content"] = nil
@@ -547,7 +593,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var outTools []ToolCall
 	finish := "stop"
 	if bridgeActive {
-		outText, outTools = responseOutput(res)
+		var ferr error
+		outText, outTools, ferr = finishTools(&res)
+		if ferr != nil {
+			conv.reset()
+			writeToolError(ferr)
+			return
+		}
 		if len(outTools) > 0 {
 			finish = "tool_calls"
 		}
@@ -633,7 +685,7 @@ func (s *Server) execNonStream(ctx context.Context, in ChatInput) (ChatResult, e
 			continue
 		}
 		started := time.Now()
-		res, err = s.upstream.Chat(ctx, sess, in, nil)
+		res, err = s.chat(ctx, sess, in, nil)
 		s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
 			Duration:         time.Since(started),
 			PromptTokens:     res.Usage.PromptTokens,

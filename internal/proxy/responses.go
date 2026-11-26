@@ -384,18 +384,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		text := res.Text
-		var bridgeReplies []ToolCallReply
+		var toolCalls []ToolCall
 		if bridgeActive {
-			text, bridgeReplies = parseClientToolCalls(text, bridgeAllowed)
-			if !parallelTools && len(bridgeReplies) > 1 {
-				bridgeReplies = bridgeReplies[:1]
+			var rerr error
+			text, toolCalls, rerr = resolveToolCalls(res, bridgeAllowed, choiceMode, choiceName, parallelTools)
+			if rerr != nil {
+				code := "upstream_error"
+				if errors.Is(rerr, errToolMarker) {
+					code = "invalid_tool_call"
+				}
+				writeOpenAIError(w, http.StatusBadGateway, code, rerr.Error())
+				return
 			}
 		}
-		if len(bridgeReplies) == 0 {
-			bridgeReplies = nativeToolReplies(res.ToolCalls, allowedTools)
-		}
-		bridgeReplies = limitToolReplies(bridgeReplies, choiceMode, choiceName, parallelTools)
-		toolCalls := replyToolCalls(bridgeReplies)
 		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
 			return
@@ -588,7 +589,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			lastErr = err
 			continue
 		}
-		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
+		res, err = s.chat(ctx, sess, in, func(ev StreamEvent) error {
 			switch ev.Type {
 			case "text":
 				if ev.Text == "" {
@@ -653,10 +654,21 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	var completedItems []map[string]any
 	if bridgeActive {
-		text, replies := parseClientToolCalls(bridgeBuffer.String(), bridgeAllowed)
-		if !parallelTools && len(replies) > 1 {
-			replies = replies[:1]
+		var rerr error
+		text, toolCalls, rerr := resolveToolCalls(ChatResult{Text: bridgeBuffer.String(), ToolCalls: res.ToolCalls}, bridgeAllowed, choiceMode, choiceName, parallelTools)
+		if rerr != nil {
+			code := "upstream_error"
+			if errors.Is(rerr, errToolMarker) {
+				code = "invalid_tool_call"
+			}
+			if !started {
+				writeOpenAIError(w, http.StatusBadGateway, code, rerr.Error())
+				return
+			}
+			writeSSE("error", map[string]any{"code": code, "message": rerr.Error()})
+			return
 		}
+		replies := toolCalls
 		if strings.TrimSpace(text) == "" && len(replies) == 0 {
 			if !started {
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
@@ -680,7 +692,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			})
 			completedItems = append(completedItems, closeTextItem())
 		}
-		for _, tc := range replyToolCalls(replies) {
+		for _, tc := range replies {
 			fcID := "fc_" + strings.ReplaceAll(uuid(), "-", "")
 			idx := nextOutputIdx
 			nextOutputIdx++

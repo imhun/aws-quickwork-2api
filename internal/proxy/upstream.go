@@ -73,6 +73,10 @@ func (u *Usage) add(v Usage) {
 	u.PromptTokens += max(v.PromptTokens, 0)
 	u.CompletionTokens += max(v.CompletionTokens, 0)
 	u.TotalTokens += max(v.PromptTokens, 0) + max(v.CompletionTokens, 0)
+	// 修复重排等多次调用累加后，total 不应小于 prompt+completion。
+	if u.TotalTokens < u.PromptTokens+u.CompletionTokens {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
 	u.CacheReadTokens += max(v.CacheReadTokens, 0)
 	u.CacheWriteTokens += max(v.CacheWriteTokens, 0)
 	if v.CostUSD != nil && *v.CostUSD >= 0 && !math.IsNaN(*v.CostUSD) && !math.IsInf(*v.CostUSD, 0) {

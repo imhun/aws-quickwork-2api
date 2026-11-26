@@ -11,6 +11,7 @@ A single Go executable handles native OAuth / PKCE login, SQLite account storage
 ## Features
 
 - `POST /v1/chat/completions` with streaming SSE and non-streaming responses.
+- `POST /v1/responses` with OpenAI Responses API compatibility, including SSE streaming, non-streaming responses, tool bridging, and multi-turn `function_call_output` context.
 - `GET /v1/models` listing configured local model aliases.
 - Native social and enterprise OAuth / PKCE login; manual callback submission works on remote servers without an accessible callback port.
 - SQLite accounts with round-robin selection, automatic token refresh, and classified retries before streaming begins, including single-account temporary-failure recovery.

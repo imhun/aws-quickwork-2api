@@ -38,7 +38,56 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
-	return s.withCORS(mux)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	return s.withLogging(s.withCORS(s.normalizePath(mux)))
+}
+
+// normalizePath 兼容常见路径变体（例如重复的 /v1/v1/、缺少 /v1 前缀或结尾多余斜线）。
+func (s *Server) normalizePath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if len(p) > 1 && strings.HasSuffix(p, "/") {
+			p = strings.TrimRight(p, "/")
+		}
+		for strings.HasPrefix(p, "/v1/v1/") {
+			p = strings.TrimPrefix(p, "/v1")
+		}
+		switch p {
+		case "/models", "/chat/completions", "/responses":
+			p = "/v1" + p
+		}
+		if p != r.URL.Path {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = p
+			r = r2
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Flush() {
+	if f, ok := sr.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *Server) withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+	})
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -565,6 +614,47 @@ func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Accou
 		return
 	}
 	log.Print(line)
+}
+
+// execNonStream 按账号轮询与重试上限执行单次非流式上游请求。
+func (s *Server) execNonStream(ctx context.Context, in ChatInput) (ChatResult, error) {
+	var res ChatResult
+	var lastErr error
+	for range s.maxAttempts() {
+		acct, err := s.accounts.Next(ctx)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		sess := SessionFromAccount(acct, s.cfg)
+		if err := sess.validate(); err != nil {
+			s.accounts.ReportFailure(ctx, acct.ID, err)
+			lastErr = err
+			continue
+		}
+		started := time.Now()
+		res, err = s.upstream.Chat(ctx, sess, in, nil)
+		s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
+			Duration:         time.Since(started),
+			PromptTokens:     res.Usage.PromptTokens,
+			CompletionTokens: res.Usage.CompletionTokens,
+			TotalTokens:      res.Usage.TotalTokens,
+			CacheReadTokens:  res.Usage.CacheReadTokens,
+			CacheWriteTokens: res.Usage.CacheWriteTokens,
+			CostUSD:          res.Usage.CostUSD,
+			Credits:          res.Usage.Credits,
+			Success:          err == nil,
+		})
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		s.accounts.ReportFailure(ctx, acct.ID, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return res, lastErr
 }
 
 func (s *Server) maxAttempts() int {

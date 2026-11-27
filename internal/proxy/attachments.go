@@ -13,16 +13,15 @@ import (
 	"time"
 )
 
-// The upstream user_message frame is capped at 64 KB. A caller prompt that
+// The upstream user_message frame is capped at 64 KB. Caller content that
 // cannot fit is uploaded out of band through the tenant attachment service and
 // referenced from a short user_message instead. This mirrors the desktop
 // renderer's nZ()/aZn() + lZn() flow (upload-attachment -> attachment-dlp-status
 // -> qbs-event files/upload/{conversation} -> payload.attachments[].path).
 const (
-	attachmentPromptPrefix  = "prompt-"
-	attachmentPromptSuffix  = ".txt"
-	attachmentMimeType      = "text/plain"
-	attachmentMinPromptSize = 8 * 1024
+	attachmentPromptPrefix = "prompt-"
+	attachmentPromptSuffix = ".txt"
+	attachmentMimeType     = "text/plain"
 	// The desktop client polls the DLP verdict every 1.5 s for up to 60
 	// attempts (90 s); match that budget so larger files are not cut short.
 	attachmentPollInterval = 1500 * time.Millisecond
@@ -61,8 +60,12 @@ func attachmentPromptName(messageID string) string {
 	return attachmentPromptPrefix + suffix + attachmentPromptSuffix
 }
 
-func attachmentShortText(name string) string {
-	return "The user's full message for this turn is in the attached file " + name + ". Read it and respond to it."
+// attachmentRelayText 是附件上传成功后的帧内文本。整个 relay 内容都在附件里，
+// 因此这里必须明确附件就是本轮的完整调用方 prompt，避免模型只把它当参考资料。
+func attachmentRelayText(name string) string {
+	return "The API caller's complete instructions, tool interface, and user message for this turn " +
+		"are in the attached file " + name + ". Treat that file as the caller's full prompt: " +
+		"follow its instructions, use only the tools it defines, and answer the user message it contains."
 }
 
 // userMessageBytes returns the wire size of one user_message frame. The
@@ -74,14 +77,6 @@ func userMessageBytes(payload map[string]any) (int, error) {
 		return 0, err
 	}
 	return len(body), nil
-}
-
-// shouldAttachPrompt reports whether the prompt is large enough to justify an
-// out-of-band upload. Even when the caller's system prompt alone is oversized,
-// uploading the prompt is still worthwhile: the short reference leaves more
-// room for the system prompt before fitUserMessage has to trim it.
-func shouldAttachPrompt(promptSize int) bool {
-	return promptSize >= attachmentMinPromptSize
 }
 
 // uploadPromptAttachment performs the three-step out-of-band upload. It

@@ -673,44 +673,75 @@ func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Accou
 }
 
 // execNonStream 按账号轮询与重试上限执行单次非流式上游请求。
-func (s *Server) execNonStream(ctx context.Context, in ChatInput) (ChatResult, error) {
+// pinAccountID 非 0 时只在指定账号上尝试一次，供会话复用固定账号使用；
+// 失败后由调用方重置会话并改为全量重试。
+func (s *Server) execNonStream(ctx context.Context, in ChatInput, pinAccountID int64) (ChatResult, *store.Account, error) {
+	if pinAccountID != 0 {
+		acct, err := s.accounts.NextPinned(ctx, pinAccountID)
+		if err != nil {
+			return ChatResult{}, nil, err
+		}
+		return s.execNonStreamOnce(ctx, acct, in)
+	}
 	var res ChatResult
 	var lastErr error
+	var lastAccount *store.Account
 	for range s.maxAttempts() {
 		acct, err := s.accounts.Next(ctx)
 		if err != nil {
 			lastErr = err
 			break
 		}
-		sess := SessionFromAccount(acct, s.cfg)
-		if err := sess.validate(); err != nil {
-			s.accounts.ReportFailure(ctx, acct.ID, err)
-			lastErr = err
-			continue
+		lastAccount = acct
+		res, _, lastErr = s.execNonStreamOnce(ctx, acct, in)
+		if lastErr == nil {
+			return res, acct, nil
 		}
-		started := time.Now()
-		res, err = s.chat(ctx, sess, in, nil)
-		s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
-			Duration:         time.Since(started),
-			PromptTokens:     res.Usage.PromptTokens,
-			CompletionTokens: res.Usage.CompletionTokens,
-			TotalTokens:      res.Usage.TotalTokens,
-			CacheReadTokens:  res.Usage.CacheReadTokens,
-			CacheWriteTokens: res.Usage.CacheWriteTokens,
-			CostUSD:          res.Usage.CostUSD,
-			Credits:          res.Usage.Credits,
-			Success:          err == nil,
-		})
-		if err == nil {
-			return res, nil
-		}
-		lastErr = err
-		s.accounts.ReportFailure(ctx, acct.ID, err)
 		if ctx.Err() != nil {
 			break
 		}
 	}
-	return res, lastErr
+	return res, lastAccount, lastErr
+}
+
+func (s *Server) execNonStreamOnce(ctx context.Context, acct *store.Account, in ChatInput) (ChatResult, *store.Account, error) {
+	sess := SessionFromAccount(acct, s.cfg)
+	if err := sess.validate(); err != nil {
+		s.accounts.ReportFailure(ctx, acct.ID, err)
+		return ChatResult{}, acct, err
+	}
+	started := time.Now()
+	res, err := s.chatChunked(ctx, sess, in, nil)
+	s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
+		Duration:         time.Since(started),
+		PromptTokens:     res.Usage.PromptTokens,
+		CompletionTokens: res.Usage.CompletionTokens,
+		TotalTokens:      res.Usage.TotalTokens,
+		CacheReadTokens:  res.Usage.CacheReadTokens,
+		CacheWriteTokens: res.Usage.CacheWriteTokens,
+		CostUSD:          res.Usage.CostUSD,
+		Credits:          res.Usage.Credits,
+		Success:          err == nil,
+	})
+	if err != nil {
+		s.accounts.ReportFailure(ctx, acct.ID, err)
+	}
+	return res, acct, err
+}
+
+// execNonStreamPrefer 先在指定账号上执行一次，失败后再走常规多账号轮询。
+// 会话复用失败需要全量重发时使用，既优先保持在原账号，又不至于因单账号
+// 故障而放弃其它可用账号。
+func (s *Server) execNonStreamPrefer(ctx context.Context, in ChatInput, preferAccountID int64) (ChatResult, *store.Account, error) {
+	if preferAccountID != 0 {
+		acct, err := s.accounts.NextPinned(ctx, preferAccountID)
+		if err == nil {
+			if res, used, callErr := s.execNonStreamOnce(ctx, acct, in); callErr == nil {
+				return res, used, nil
+			}
+		}
+	}
+	return s.execNonStream(ctx, in, 0)
 }
 
 func (s *Server) maxAttempts() int {
@@ -724,6 +755,7 @@ func (s *Server) maxAttempts() int {
 func (s *Server) mapModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	m = strings.TrimPrefix(m, "quickwork/")
+	m = strings.TrimPrefix(m, "aws-quick/")
 	m = strings.TrimPrefix(m, "qw-")
 	switch m {
 	case "smart", "fast", "balanced", "auto":

@@ -40,15 +40,19 @@ func NewUpstream(cfg *config.Config) *Upstream {
 
 // ChatInput is one upstream turn.
 type ChatInput struct {
-	Messages      []Message
-	Prompt        string
-	Model         string
-	ThreadID      string
-	Title         string
-	SystemPrompt  string
-	ChatAgentID   string
-	CreateSession bool
-	DeleteSession bool
+	Messages       []Message
+	Prompt         string
+	Model          string
+	ThreadID       string
+	Title          string
+	SystemPrompt   string
+	ChatAgentID    string
+	ThinkingEffort string
+	CreateSession  bool
+	DeleteSession  bool
+	// RelayChunk 标记同一轮 relay 文本的分帧片段。片段必须保持内联，
+	// 不能再走上附件回退，否则上游会把调用方指令当成本轮附件材料。
+	RelayChunk bool
 }
 
 // ToolCallState is a native tool invocation reported by the QuickWork agent.
@@ -99,6 +103,7 @@ type EventFunc func(StreamEvent) error
 
 type ChatResult struct {
 	Text      string
+	Thinking  string
 	ToolCalls []ToolCallState
 	Usage     Usage
 	ThreadID  string
@@ -219,71 +224,48 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		})
 	}
 
-	payload := map[string]any{
-		"text":               relayPrompt(in.SystemPrompt, in.Prompt),
-		"send_origin":        "programmatic",
-		"had_physical_input": false,
-		"surfaceType":        sess.Surface,
-		"outpostId":          sess.OutpostID,
-		"appVersion":         u.cfg.AppVersion,
-		"traceId":            traceID,
-		"message_id":         messageID,
-		"thread_id":          threadID,
-		"agent_mode":         in.Model,
-		"user_timezone":      u.cfg.Timezone,
-		"user_locale":        u.cfg.Locale,
-		"chat_agent_id":      nil,
-		"auto_routing":       false,
-		"web_search_enabled": false,
-		"pre_approved_tools": []any{},
-		"preload_skills":     []any{},
-		"panel_edits":        []any{},
-		"custom_prompt":      nil,
-	}
-	if id := strings.TrimSpace(in.ChatAgentID); id != "" {
-		payload["chat_agent_id"] = id
-	}
-	// The service ignores a per-turn "system_prompt" field and treats
-	// "custom_prompt" as low-trust saved preferences, so caller instructions are
-	// carried at the head of the user_message text instead (see relayPrompt).
-	if u.cfg.ThinkingEffort != "" {
-		payload["thinking_effort"] = u.cfg.ThinkingEffort
-	}
+	payload := buildUserMessagePayload(u.cfg, sess, in, threadID, messageID, traceID,
+		relayPrompt(in.SystemPrompt, in.Prompt))
 
-	// A single user_message is capped at 64 KB. When the caller's prompt is
-	// what pushes the frame over the limit, upload it out of band and send a
-	// short reference instead; the file bytes never enter the WebSocket frame.
-	// The normal trimming path below remains the fallback when the tenant
-	// attachment service is unavailable or blocked. Gateway transports use a
-	// different upload route and keep the trimming path for now.
-	if !isGatewayProvider(sess.Provider) && strings.TrimSpace(sess.TenantURL) != "" {
+	// 上游单个 user_message 帧上限 64 KB。超限时把整段 relay 文本
+	// （指令 + 工具定义 + 对话）作为附件上传，帧内只保留短引用。
+	// 附件服务不可用时回退到下面的截断逻辑；Gateway 传输走不同的上传
+	// 通道，暂时仍使用截断逻辑。分帧片段不能走附件分支。
+	if !in.RelayChunk && !isGatewayProvider(sess.Provider) && strings.TrimSpace(sess.TenantURL) != "" {
 		if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes {
+			text := relayPrompt(in.SystemPrompt, in.Prompt)
 			name := attachmentPromptName(messageID)
-			if shouldAttachPrompt(len(in.Prompt)) {
-				att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, []byte(in.Prompt))
-				if attErr != nil {
-					log.Printf("user_message attachment unavailable thread=%s bytes=%d: %v", threadID, len(in.Prompt), attErr)
-				} else if att.Path != "" {
-					payload["text"] = relayPrompt(in.SystemPrompt, attachmentShortText(att.Name))
-					meta := map[string]any{
-						"type":     "file",
-						"name":     att.Name,
-						"size":     att.Size,
-						"mimeType": attachmentMimeType,
-						"path":     att.Path,
-					}
-					if att.ID != "" {
-						meta["attachmentId"] = att.ID
-					}
-					payload["attachments"] = []map[string]any{meta}
-					log.Printf("user_message attachment thread=%s bytes=%d name=%s id=%s path=%s",
-						threadID, att.Size, att.Name, att.ID, att.Path)
+			att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, []byte(text))
+			if attErr != nil {
+				log.Printf("user_message attachment unavailable thread=%s bytes=%d: %v", threadID, len(text), attErr)
+			} else if att.Path != "" {
+				payload["text"] = attachmentRelayText(att.Name)
+				meta := map[string]any{
+					"type":     "file",
+					"name":     att.Name,
+					"size":     att.Size,
+					"mimeType": attachmentMimeType,
+					"path":     att.Path,
 				}
+				if att.ID != "" {
+					meta["attachmentId"] = att.ID
+				}
+				payload["attachments"] = []map[string]any{meta}
+				log.Printf("user_message attachment thread=%s bytes=%d name=%s id=%s path=%s",
+					threadID, att.Size, att.Name, att.ID, att.Path)
 			}
 		}
 	}
 
-	if err := fitUserMessage(payload, in); err != nil {
+	if in.RelayChunk {
+		n, err := userMessageBytes(payload)
+		if err != nil {
+			return ChatResult{}, err
+		}
+		if n > maxUserMessageBytes {
+			return ChatResult{}, fmt.Errorf("relay chunk frame %d bytes: %w", n, ErrUserMessageTooLarge)
+		}
+	} else if err := fitUserMessage(payload, in); err != nil {
 		return ChatResult{}, err
 	}
 	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
@@ -299,6 +281,45 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		return result, err
 	}
 	return result, nil
+}
+
+// buildUserMessagePayload 统一构造 user_message 的 payload。分帧预算和真实
+// 发送必须使用同一份字段，否则 UUID、模型名等开销会让分段重新超过 64 KB。
+func buildUserMessagePayload(cfg *config.Config, sess *Session, in ChatInput, threadID, messageID, traceID, text string) map[string]any {
+	payload := map[string]any{
+		"text":               text,
+		"send_origin":        "programmatic",
+		"had_physical_input": false,
+		"surfaceType":        sess.Surface,
+		"outpostId":          sess.OutpostID,
+		"appVersion":         cfg.AppVersion,
+		"traceId":            traceID,
+		"message_id":         messageID,
+		"thread_id":          threadID,
+		"agent_mode":         in.Model,
+		"user_timezone":      cfg.Timezone,
+		"user_locale":        cfg.Locale,
+		"chat_agent_id":      nil,
+		"auto_routing":       false,
+		"web_search_enabled": false,
+		"pre_approved_tools": []any{},
+		"preload_skills":     []any{},
+		"panel_edits":        []any{},
+		"custom_prompt":      nil,
+	}
+	if id := strings.TrimSpace(in.ChatAgentID); id != "" {
+		payload["chat_agent_id"] = id
+	}
+	// 上游会忽略单轮请求里的 system_prompt，并把 custom_prompt 当成低信任的
+	// 已保存偏好，因此调用方指令放在 user_message 正文开头（见 relayPrompt）。
+	thinkingEffort := strings.TrimSpace(in.ThinkingEffort)
+	if thinkingEffort == "" {
+		thinkingEffort = cfg.ThinkingEffort
+	}
+	if thinkingEffort != "" {
+		payload["thinking_effort"] = thinkingEffort
+	}
+	return payload
 }
 
 func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, gateway bool, err error) {
@@ -372,6 +393,7 @@ func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, g
 func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway bool, threadID string, onEvent EventFunc) (ChatResult, error) {
 	var result ChatResult
 	var text strings.Builder
+	var thinking strings.Builder
 	sawMessageComplete := false
 	turnComplete := false
 	var completeDeadline time.Time
@@ -438,6 +460,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 
 	finish := func() (ChatResult, error) {
 		result.Text = text.String()
+		result.Thinking = thinking.String()
 		creditTotals := make(map[string]float64)
 		for _, credit := range creditSnapshots {
 			if credit.amount != nil {
@@ -605,6 +628,34 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				credit.amount = payload.CostValue
 			}
 			creditSnapshots[messageID] = credit
+		case "thinking_start":
+			turnComplete = false
+			completeDeadline = time.Time{}
+		case "thinking_delta":
+			delta := deltaText(env.Payload)
+			if delta == "" {
+				continue
+			}
+			turnComplete = false
+			completeDeadline = time.Time{}
+			thinking.WriteString(delta)
+			if onEvent != nil {
+				if err := onEvent(StreamEvent{Type: "thinking", Text: delta}); err != nil {
+					res, _ := finish()
+					return res, err
+				}
+			}
+		case "thinking_complete":
+			// thinking_complete 携带的是累计全文，用它校准增量缓冲。
+			var p struct {
+				Thinking string `json:"thinking"`
+			}
+			if json.Unmarshal(env.Payload, &p) == nil {
+				if full := p.Thinking; strings.HasPrefix(full, thinking.String()) && len(full) > thinking.Len() {
+					thinking.Reset()
+					thinking.WriteString(full)
+				}
+			}
 		case "text_delta":
 			delta := deltaText(env.Payload)
 			if delta == "" {

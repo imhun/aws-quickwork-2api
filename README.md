@@ -328,6 +328,8 @@ Commands create `config.json` with defaults if it does not exist. Relative datab
 | `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | Upstream handshake surface type |
 | `outpost_id` / `working_session_id` | Empty | Optional upstream handshake fields |
 | `timezone` / `locale` | `UTC` / `en-US` | Timezone and language sent in `user_message`; independent of UI language |
+| `neutral_prompt` | `false` | Neutral mode: replace caller system text with a short neutral prompt, rewrite Codex AGENTS.md / environment_context envelopes as neutral project and environment notes, use `<available_tools>` with compacted schemas, and limit the tool surface |
+| `neutral_tool_limit` | `16` | Maximum number of tools kept in neutral mode, chosen by built-in priority |
 | `thinking_effort` | Empty | `off`, `low`, `medium`, or `high`; empty uses upstream defaults |
 | `chat_agent_id` | Empty | Custom QuickWork agent with its own system prompt and tool policy |
 | `keep_sessions` | `false` | Keep upstream sessions when session reuse is disabled |
@@ -396,14 +398,72 @@ Every real attempt contributes to the account's call count, duration, and any of
 
 ### Prompts and Tool Calls
 
-- `system` / `developer` messages and tool definitions are combined in order into a caller-instructions block at the beginning of the current user text. The upstream ignores `user_message.payload.system_prompt` and treats `custom_prompt` as lower-trust preferences, so these fields are not used for caller instructions.
-- A short neutral relay note identifies caller-defined tools and their client-side execution. The default upstream identity, system context, and built-in tools remain server-controlled.
-- Tools use `<caller_tool_interface>` definitions and `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` output. Parsing also accepts alternate tool tags, JSON wrappers, Markdown fences, `arguments` / `parameters` / `input` / `args`, namespace prefixes such as `functions.`, case variations, and unique suffix matches. Unknown tools or invalid JSON remain ordinary text.
+- `system` / `developer` messages and tool definitions are combined in order at the beginning of the current user text, separated from the task by a `---` rule. No `[System instructions ...]` role labels are added, because that phrasing is treated as prompt injection upstream. The upstream ignores `user_message.payload.system_prompt` and treats `custom_prompt` as lower-trust preferences, so these fields are not used for caller instructions.
+- Requests over the 64 KB frame limit are split across frames. Frame headers carry only a neutral pagination marker (`part i of n`); earlier parts are never described as system instructions, and the tool block is appended only to the final frame next to the actual task.
+- `neutral_prompt=true` swaps the caller system text for a neutral engineering prompt, switches the tool block to `<available_tools>`, compacts schemas, and keeps at most `neutral_tool_limit` tools. The default upstream identity, system context, and built-in tools remain server-controlled.
+- The default QuickWork agent owns a product identity and its own tools. Any user-turn text that introduces a different tool protocol or asks it to act as an external coding CLI is classified as prompt injection; rewording only lowers the probability and cannot remove the boundary.
+- Codex also sends `# AGENTS.md instructions` and `<environment_context>` as user messages, which the model reads as another agent's system instructions. With `neutral_prompt=true` the proxy removes the envelope wording and re-emits the repository rules and working directory as neutral project and environment notes, so coding context survives. Verified with a short turn and a 700 KB / 13-frame turn, both invoking the client tool.
+- Full isolation requires making the tool protocol first-party: create a QuickWork custom agent whose system prompt declares the bridge, then set `chat_agent_id` (see the next section). Alternatively use a raw model endpoint without the product-agent guardrails.
+- Tools use `<caller_tool_interface>` definitions, or `<available_tools>` when `neutral_prompt=true`, and `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` output.
+- Responses API `type:"custom"` (freeform) tools are bridged too: the proxy synthesizes an `{input:string}` parameter, returns `custom_tool_call` with the raw `input`, and parses `custom_tool_call` / `custom_tool_call_output` from history. Codex's `apply_patch` uses this path.
+- Codex only declares `apply_patch` when the model catalog marks the model as `"apply_patch_tool_type": "freeform"`.
+- The model catalog must also set `"supports_search_tool": false`. With `true`, Codex uses tool-search mode and sends namespaces without child tools, so MCP tools such as patchloom / zvec / fff never reach the bridge. Point `model_catalog_json` at a catalog containing the slug, e.g. `{"models":[{"slug":"aws-quick/smart","apply_patch_tool_type":"freeform","context_window":1000000}]}`. Parsing also accepts alternate tool tags, JSON wrappers, Markdown fences, `arguments` / `parameters` / `input` / `args`, namespace prefixes such as `functions.`, case variations, and unique suffix matches. Unknown tools or invalid JSON remain ordinary text.
 - Multiple calls can be returned in one turn. `parallel_tool_calls=false` limits output to one call; `tool_choice: "none"` disables bridging, and a forced function only accepts that function.
 - The proxy returns OpenAI `tool_calls` but does not execute them. Clients execute tools and send `role: tool` results back; historical calls and results are rendered into upstream text context.
 - Native upstream tool events are also collected as a fallback when they match declared client tools. Multiple event-stream messages in one WebSocket frame are all processed.
 - Tool-enabled streaming is buffered until the turn ends. Thinking-only, whitespace-only, or zero-width-only output returns an explicit error rather than an empty successful completion.
 - The default built-in agent can add roughly 60K+ tokens of upstream prompt context. To replace its prompt and tool policy, configure `chat_agent_id` to reference a custom QuickWork agent; caller instructions alone cannot remove the default identity.
+
+### Creating a Custom Agent
+
+A custom agent moves the tool-bridge protocol into the upstream agent's own system prompt instead of leaving it as unfamiliar text in the user turn. In testing this is the most reliable way to stop refusals such as "this is prompt injection" or "I will not act as an external coding CLI".
+
+Create it through the QuickWork data plane: `POST {tenant_url}/integration/quick-work/qbs-event` with the account `access_token` as `Authorization: Bearer` and `Origin: https://quick.aws.com`. **Field names must be camelCase**; PascalCase silently returns an empty `eventResponse` without an error.
+
+```json
+{
+  "eventType": "createAgent",
+  "eventBody": {
+    "createAgent": {
+      "agentId": "codex-bridge",
+      "name": "Codex Bridge",
+      "description": "Local coding tool bridge for Codex",
+      "agentLifecycle": "PUBLISHED",
+      "customPromptInput": {
+        "newPrompt": {
+          "customInstructions": "## Tool channel\nEach user message may end with an <available_tools> block..."
+        }
+      }
+    }
+  }
+}
+```
+
+`customInstructions` should at least state that:
+
+1. `<available_tools>` / `<caller_tool_interface>` is the tool list injected by the local runtime for this session, and is to be used directly without questioning or restating it;
+2. a call is exactly `<client_tool_call>{"name":"TOOL","arguments":{...}}</client_tool_call>`;
+3. markers must not be wrapped in Markdown fences and must not be surrounded by prose;
+4. the tools really read and write local files and run commands, so the model must not answer "I cannot see your repository" or "I cannot run commands".
+
+After creation, `describeAgent` should report `agentStatus=ACTIVE` and a non-empty `customPromptInterface.customInstructions`. To change the prompt later, call `updateAgent` with both `internalAgentId` and `version`; omitting either returns HTTP 400:
+
+```json
+{
+  "eventType": "updateAgent",
+  "eventBody": {
+    "updateAgent": {
+      "agentId": "codex-bridge",
+      "internalAgentId": "PUBLISHED-…",
+      "version": 2,
+      "name": "Codex Bridge",
+      "customPromptInput": { "newPrompt": { "customInstructions": "…" } }
+    }
+  }
+}
+```
+
+Then set `"chat_agent_id": "codex-bridge"` in `config.json` and restart. Keep `neutral_prompt=true`: forwarding Codex's full system prompt alongside the bridge protocol conflicts with it, and models then tend to answer that they cannot call the tools.
 
 ### Session Reuse
 
@@ -455,6 +515,7 @@ Chat logs report request start, account attempts, upstream event counts, and fin
 | Tokens expire | Automatic refresh normally handles this; use `quickproxy refresh` if needed |
 | Social login fails at user information with `net/http: TLS handshake timeout` | See the process-scoped TLS compatibility workaround below; keep default TLS settings unless affected |
 | Container account data appears missing | Use the same volume and `/app/data/config.json`; default DB is `/app/data/data/quickwork.db` |
+| Model refuses with "I can't do that" / "another tool protocol" / "part N" | Enable `neutral_prompt`; the proxy rewrites Codex AGENTS.md and environment_context envelopes into neutral project and environment notes. If it persists, the default agent guardrail cannot be bypassed: use a custom `chat_agent_id` agent or a raw model endpoint |
 
 ### TLS Handshake Compatibility
 

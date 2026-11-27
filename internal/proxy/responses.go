@@ -5,26 +5,52 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"quickwork-openai/internal/accounts"
+	"quickwork-openai/internal/store"
 )
 
 // ResponsesRequest 代表 OpenAI Responses API (/v1/responses) 的請求結構。
 type ResponsesRequest struct {
-	Model             string          `json:"model"`
-	Instructions      string          `json:"instructions,omitempty"`
-	Input             any             `json:"input"`
-	Stream            bool            `json:"stream"`
-	Tools             []responsesTool `json:"tools,omitempty"`
-	ToolChoice        any             `json:"tool_choice,omitempty"`
-	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
-	MaxOutputTokens   int             `json:"max_output_tokens,omitempty"`
-	Temperature       *float64        `json:"temperature,omitempty"`
-	Store             *bool           `json:"store,omitempty"`
-	PreviousRespID    string          `json:"previous_response_id,omitempty"`
+	Model             string                     `json:"model"`
+	Instructions      string                     `json:"instructions,omitempty"`
+	Input             any                        `json:"input"`
+	Stream            bool                       `json:"stream"`
+	Tools             []responsesTool            `json:"tools,omitempty"`
+	ToolChoice        any                        `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool                      `json:"parallel_tool_calls,omitempty"`
+	MaxOutputTokens   int                        `json:"max_output_tokens,omitempty"`
+	Temperature       *float64                   `json:"temperature,omitempty"`
+	Store             *bool                      `json:"store,omitempty"`
+	PreviousRespID    string                     `json:"previous_response_id,omitempty"`
+	PromptCacheKey    string                     `json:"prompt_cache_key,omitempty"`
+	Reasoning         *responsesReasoning        `json:"reasoning,omitempty"`
+	ClientMetadata    map[string]json.RawMessage `json:"client_metadata,omitempty"`
+}
+
+// responsesReasoning 是 Responses API 的思考配置（Codex 會帶上 effort/summary）。
+type responsesReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
+}
+
+// upstreamThinkingEffort 把客戶端的 reasoning.effort 映射為上游 thinking_effort。
+func upstreamThinkingEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "xhigh", "max", "ultra", "persistent":
+		return "high"
+	default:
+		return ""
+	}
 }
 
 // responsesTool 同時相容 Responses API 扁平格式與 Chat Completions 巢狀格式。
@@ -35,34 +61,133 @@ type responsesTool struct {
 	Parameters  any           `json:"parameters,omitempty"`
 	Strict      bool          `json:"strict,omitempty"`
 	Function    *ToolFunction `json:"function,omitempty"`
+	// Format 是 custom（freeform）工具的输入格式，例如 apply_patch 的 grammar。
+	Format any `json:"format,omitempty"`
+	// Tools 是 Codex 新版 namespace 聚合工具的子工具列表。
+	Tools []responsesTool `json:"tools,omitempty"`
+}
+
+// toolOrigin 記録扁平化後的工具名在客戶端命名空間中的原始位置。
+type toolOrigin struct {
+	namespace string
+	name      string
 }
 
 // toChatTools 將 Responses API 的 tools 轉換為內部統一使用的 []Tool。
 func toChatTools(tools []responsesTool) []Tool {
+	out, _ := expandNamespaceTools(tools)
+	return out
+}
+
+// expandNamespaceTools 把客戶端的 namespace 聚合工具展開為扁平的 function 工具。
+//
+// Codex 對支持 tool search 的模型會把整個 MCP server 聲明成一個
+// `type: "namespace"` 條目（內含 66 個子工具、描述可達幾十 KB），模型側只認
+// 扁平函數名。展開後按 `<namespace>_<tool>` 命名，並記錄來源以便回傳調用時
+// 還原成 namespace + name。
+func expandNamespaceTools(tools []responsesTool) ([]Tool, map[string]toolOrigin) {
 	out := make([]Tool, 0, len(tools))
-	for _, t := range tools {
-		typ := strings.ToLower(strings.TrimSpace(t.Type))
-		if typ != "" && typ != "function" {
-			// 非 function 類型的內建工具（如 web_search）目前無法由客戶端橋接執行，略過之。
-			continue
-		}
-		if t.Function != nil && strings.TrimSpace(t.Function.Name) != "" {
-			out = append(out, Tool{Type: "function", Function: *t.Function})
-			continue
-		}
-		if strings.TrimSpace(t.Name) != "" {
-			out = append(out, Tool{
-				Type: "function",
-				Function: ToolFunction{
-					Name:        t.Name,
+	origins := make(map[string]toolOrigin)
+	var walk func(items []responsesTool, namespace string)
+	walk = func(items []responsesTool, namespace string) {
+		for _, t := range items {
+			typ := strings.ToLower(strings.TrimSpace(t.Type))
+			switch typ {
+			case "namespace":
+				child := strings.TrimSpace(t.Name)
+				if namespace != "" && child != "" {
+					child = namespace + "_" + child
+				}
+				walk(t.Tools, child)
+			case "", "function":
+				fn := ToolFunction{
 					Description: t.Description,
 					Parameters:  t.Parameters,
 					Strict:      t.Strict,
-				},
-			})
+				}
+				if t.Function != nil {
+					fn = *t.Function
+				}
+				name := strings.TrimSpace(fn.Name)
+				if name == "" {
+					name = strings.TrimSpace(t.Name)
+				}
+				if name == "" {
+					continue
+				}
+				fn.Name = name
+				if namespace != "" {
+					fn.Name = namespace + "_" + name
+					origins[fn.Name] = toolOrigin{namespace: namespace, name: name}
+				}
+				out = append(out, Tool{Type: "function", Function: fn})
+			case "custom":
+				// freeform 工具（如 apply_patch）只有一段原始文本输入。桥接时把它
+				// 包装成 {"input": "..."} 的 JSON 参数，回传时再还原为 custom_tool_call。
+				name := strings.TrimSpace(t.Name)
+				if name == "" {
+					continue
+				}
+				if namespace != "" {
+					name = namespace + "_" + name
+					origins[name] = toolOrigin{namespace: namespace, name: strings.TrimSpace(t.Name)}
+				}
+				description := strings.TrimSpace(t.Description)
+				if description != "" {
+					description += "\n\n"
+				}
+				description += "这个工具接收自由文本输入；调用时把原始文本作为一个字符串放进 arguments.input。"
+				out = append(out, Tool{
+					Type:   "custom",
+					Custom: true,
+					Function: ToolFunction{
+						Name:        name,
+						Description: description,
+						Parameters: map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"input": map[string]any{
+									"type":        "string",
+									"description": "工具的完整自由文本输入",
+								},
+							},
+							"required":             []any{"input"},
+							"additionalProperties": false,
+						},
+					},
+				})
+			default:
+				// 內建工具（如 web_search）無法由客戶端橋接執行，略過之。
+			}
 		}
 	}
-	return out
+	walk(tools, "")
+	return out, origins
+}
+
+// applyToolOrigins 把橋接得到的扁平工具名還原為客戶端的 namespace + 原名。
+func applyToolOrigins(calls []ToolCall, origins map[string]toolOrigin) []ToolCall {
+	for i := range calls {
+		origin, ok := origins[strings.TrimSpace(calls[i].Function.Name)]
+		if !ok {
+			continue
+		}
+		calls[i].Namespace = origin.namespace
+		calls[i].Function.Name = origin.name
+	}
+	return calls
+}
+
+// qualifyNamespacedName 把客戶端歷史中帶 namespace 的調用名轉回扁平形式，
+// 與橋接提示裡的工具定義保持一致。缺失 namespace 時原樣返回。
+func qualifyNamespacedName(name string, namespace any) string {
+	name = strings.TrimSpace(name)
+	ns, _ := namespace.(string)
+	ns = strings.TrimSpace(ns)
+	if name == "" || ns == "" || strings.HasPrefix(name, ns+"_") {
+		return name
+	}
+	return ns + "_" + name
 }
 
 // parseResponsesMessages 將 Responses API 的 instructions 與 input 轉換為 []Message。
@@ -110,6 +235,7 @@ func parseResponsesMessages(instructions string, input any) ([]Message, error) {
 					callID, _ = item["id"].(string)
 				}
 				name, _ := item["name"].(string)
+				name = qualifyNamespacedName(name, item["namespace"])
 				args := stringifyAny(item["arguments"])
 				if strings.TrimSpace(args) == "" {
 					args = "{}"
@@ -125,7 +251,26 @@ func parseResponsesMessages(instructions string, input any) ([]Message, error) {
 						},
 					}},
 				})
-			case "function_call_output":
+			case "custom_tool_call":
+				// freeform 工具（如 apply_patch）回放时只带一段原始文本。
+				callID, _ := item["call_id"].(string)
+				name, _ := item["name"].(string)
+				name = qualifyNamespacedName(name, item["namespace"])
+				input := stringifyAny(item["input"])
+				args, _ := json.Marshal(map[string]string{"input": input})
+				msgs = append(msgs, Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{{
+						ID:     callID,
+						Type:   "custom",
+						Custom: true,
+						Function: FunctionCall{
+							Name:      name,
+							Arguments: string(args),
+						},
+					}},
+				})
+			case "function_call_output", "custom_tool_call_output":
 				callID, _ := item["call_id"].(string)
 				output := extractResponsesContent(item["output"])
 				msgs = append(msgs, Message{
@@ -241,8 +386,23 @@ func responsesUsageMap(u Usage) map[string]any {
 	}
 }
 
+func buildReasoningItem(id, text string) map[string]any {
+	return map[string]any{
+		"id":      id,
+		"type":    "reasoning",
+		"summary": []map[string]any{{"type": "summary_text", "text": text}},
+	}
+}
+
 func buildResponsesOutputItems(msgID, text string, toolCalls []ToolCall) []map[string]any {
-	output := make([]map[string]any, 0, 1+len(toolCalls))
+	return buildResponsesOutputItemsWithThinking(msgID, "", text, toolCalls)
+}
+
+func buildResponsesOutputItemsWithThinking(msgID, thinking, text string, toolCalls []ToolCall) []map[string]any {
+	output := make([]map[string]any, 0, 2+len(toolCalls))
+	if strings.TrimSpace(thinking) != "" {
+		output = append(output, buildReasoningItem("rs_"+strings.ReplaceAll(uuid(), "-", ""), thinking))
+	}
 	if strings.TrimSpace(text) != "" {
 		output = append(output, map[string]any{
 			"id":     msgID,
@@ -261,16 +421,57 @@ func buildResponsesOutputItems(msgID, text string, toolCalls []ToolCall) []map[s
 		if args == "" {
 			args = "{}"
 		}
-		output = append(output, map[string]any{
+		if tc.Custom {
+			item := map[string]any{
+				"id":      "ctc_" + strings.ReplaceAll(uuid(), "-", ""),
+				"type":    "custom_tool_call",
+				"status":  "completed",
+				"call_id": tc.ID,
+				"name":    tc.Function.Name,
+				"input":   customToolInput(args),
+			}
+			if tc.Namespace != "" {
+				item["namespace"] = tc.Namespace
+			}
+			output = append(output, item)
+			continue
+		}
+		item := map[string]any{
 			"id":        "fc_" + strings.ReplaceAll(uuid(), "-", ""),
 			"type":      "function_call",
 			"status":    "completed",
 			"call_id":   tc.ID,
 			"name":      tc.Function.Name,
 			"arguments": args,
-		})
+		}
+		if tc.Namespace != "" {
+			item["namespace"] = tc.Namespace
+		}
+		output = append(output, item)
 	}
 	return output
+}
+
+// customToolNames 收集 freeform 工具名，回传时据此选择 custom_tool_call。
+func customToolNames(defs []toolDefinition) map[string]bool {
+	names := make(map[string]bool)
+	for _, d := range defs {
+		if d.Custom {
+			names[d.Name] = true
+		}
+	}
+	return names
+}
+
+// markCustomCalls 给解析出的工具调用打上 freeform 标记。必须在还原 namespace
+// 之前调用，因为 bridgeDefs 里用的是展开后的扁平名称。
+func markCustomCalls(calls []ToolCall, custom map[string]bool) {
+	if len(custom) == 0 {
+		return
+	}
+	for i := range calls {
+		calls[i].Custom = custom[calls[i].Function.Name]
+	}
 }
 
 func buildResponseObject(respID, model, instructions, status string, created int64, output []map[string]any, usage map[string]any) map[string]any {
@@ -321,13 +522,16 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if s.cfg.NeutralPrompt {
+		msgs = stripHarnessEnvelopes(msgs)
+	}
 	prompt, err := formatPrompt(msgs)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
-	chatTools := toChatTools(req.Tools)
+	chatTools, toolOrigins := expandNamespaceTools(req.Tools)
 	chatReq := ChatRequest{
 		Tools:      chatTools,
 		ToolChoice: req.ToolChoice,
@@ -341,9 +545,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if req.ParallelToolCalls != nil {
 		parallelTools = *req.ParallelToolCalls
 	}
+	decisionAllowed := decisionToolAllowed(allowedTools, choiceMode, choiceName) &&
+		!isExecClient(req.ClientMetadata) && !requestUserInputRejected(req.Input)
 
 	systemPromptText := systemPrompt(msgs)
-	bridgePrompt := buildToolBridgePrompt(&chatReq, choiceMode, choiceName, parallelTools)
+	bridgeDefs := collectToolDefinitions(chatReq.Tools, chatReq.Functions)
+	neutral := s.cfg.NeutralPrompt
+	if neutral {
+		// 中性精简模式：不转发调用方（Codex）的系统提示，只带任务说明和工具，
+		// 避免上游把整段 prompt 判成"冒充另一个 agent"或超长注入。
+		systemPromptText = neutralSystemPrompt
+		bridgeDefs = compactToolDefinitions(selectNeutralTools(bridgeDefs, s.cfg.NeutralToolLimit))
+	}
+	bridgePrompt := buildToolBridgePromptFor(bridgeDefs, chatReq.ToolChoice, choiceMode, choiceName, parallelTools, neutral)
 	bridgeActive := bridgePrompt != ""
 	if bridgeActive {
 		systemPromptText += "\n\n" + bridgePrompt
@@ -352,8 +566,30 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if choiceMode == "function" && choiceName != "" {
 		bridgeAllowed = map[string]bool{choiceName: true}
 	}
+	if dump := os.Getenv("QUICKPROXY_DUMP_PROMPT"); dump != "" {
+		_ = os.WriteFile(dump, []byte(systemPromptText+"\n=====PROMPT=====\n"+prompt), 0o644)
+	}
 
 	model := s.mapModel(req.Model)
+
+	conv := s.sessions.acquire(responsesConversationKey(r, req.PromptCacheKey, msgs, systemPromptText))
+	defer s.sessions.release(conv)
+	if conv.turns >= maxReuseTurns {
+		conv.reset()
+	}
+	resume := false
+	promptText := prompt
+	promptMessages := msgs
+	if s.cfg.SessionReuse && conv.accountID != 0 && conv.systemPrompt == systemPromptText {
+		if delta, ok := conv.delta(msgs); ok {
+			if deltaPrompt, err := formatPrompt(delta); err == nil && hasVisibleText(deltaPrompt) {
+				promptText = deltaPrompt
+				promptMessages = delta
+				resume = true
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout.Duration())
 	defer cancel()
 
@@ -362,20 +598,76 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	msgID := "msg_" + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
 
-	in := ChatInput{
-		Prompt:        prompt,
-		Model:         model,
-		ThreadID:      threadID,
-		Title:         titleFor(lastUserText(msgs)),
-		SystemPrompt:  systemPromptText,
-		ChatAgentID:   s.cfg.ChatAgentID,
-		CreateSession: true,
-		DeleteSession: !s.cfg.SessionReuse && !s.cfg.KeepSessions,
+	thinkingEffort := strings.TrimSpace(s.cfg.ThinkingEffort)
+	if thinkingEffort == "" && req.Reasoning != nil {
+		thinkingEffort = upstreamThinkingEffort(req.Reasoning.Effort)
 	}
 
+	in := ChatInput{
+		Prompt:         promptText,
+		Messages:       promptMessages,
+		Model:          model,
+		ThreadID:       threadID,
+		Title:          titleFor(lastUserText(msgs)),
+		SystemPrompt:   systemPromptText,
+		ChatAgentID:    s.cfg.ChatAgentID,
+		ThinkingEffort: thinkingEffort,
+		CreateSession:  true,
+		DeleteSession:  !s.cfg.SessionReuse && !s.cfg.KeepSessions,
+	}
+	if resume {
+		in.ThreadID = conv.threadID
+		in.CreateSession = false
+		// 复用上游线程时只发送增量；系统指令已经在线程上下文里。
+		in.SystemPrompt = ""
+	}
+
+	resetConversation := func() {
+		conv.reset()
+		resume = false
+		in.ThreadID = ""
+		in.CreateSession = true
+		in.Prompt = prompt
+		in.Messages = msgs
+		in.SystemPrompt = systemPromptText
+	}
+	rememberConversation := func(acct *store.Account, res ChatResult) {
+		if !s.cfg.SessionReuse || acct == nil || res.ThreadID == "" {
+			return
+		}
+		conv.threadID = res.ThreadID
+		conv.accountID = acct.ID
+		conv.messages = append([]Message(nil), msgs...)
+		conv.systemPrompt = systemPromptText
+		conv.turns++
+	}
+	requestedModel := strings.TrimSpace(req.Model)
+	if requestedModel == "" {
+		requestedModel = "(default)"
+	}
+	log.Printf("responses %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d reuse=%t thread=%q",
+		respID, requestedModel, model, req.Stream, len(msgs), len(promptText), len(systemPromptText), resume, in.ThreadID)
+
 	if !req.Stream {
-		res, lastErr := s.execNonStream(ctx, in)
+		var res ChatResult
+		var acct *store.Account
+		var lastErr error
+		if resume {
+			res, acct, lastErr = s.execNonStream(ctx, in, conv.accountID)
+			if lastErr != nil {
+				log.Printf("responses %s session resume failed; retrying with full transcript", respID)
+				var retryAccountID int64
+				if acct != nil {
+					retryAccountID = acct.ID
+				}
+				resetConversation()
+				res, acct, lastErr = s.execNonStreamPrefer(ctx, in, retryAccountID)
+			}
+		} else {
+			res, acct, lastErr = s.execNonStream(ctx, in, 0)
+		}
 		if lastErr != nil {
+			conv.reset()
 			status, code := http.StatusBadGateway, "upstream_error"
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
@@ -383,12 +675,14 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
+		rememberConversation(acct, res)
 		text := res.Text
 		var toolCalls []ToolCall
 		if bridgeActive {
 			var rerr error
 			text, toolCalls, rerr = resolveToolCalls(res, bridgeAllowed, choiceMode, choiceName, parallelTools)
 			if rerr != nil {
+				conv.reset()
 				code := "upstream_error"
 				if errors.Is(rerr, errToolMarker) {
 					code = "invalid_tool_call"
@@ -396,12 +690,16 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIError(w, http.StatusBadGateway, code, rerr.Error())
 				return
 			}
+			markCustomCalls(toolCalls, customToolNames(bridgeDefs))
+			toolCalls = applyToolOrigins(toolCalls, toolOrigins)
 		}
+		text, decisionCalls := extractDecisionCalls(text, decisionAllowed)
+		toolCalls = append(toolCalls, decisionCalls...)
 		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
 			return
 		}
-		output := buildResponsesOutputItems(msgID, text, toolCalls)
+		output := buildResponsesOutputItemsWithThinking(msgID, res.Thinking, text, toolCalls)
 		writeJSON(w, http.StatusOK, buildResponseObject(
 			respID, model, req.Instructions, "completed", created, output, responsesUsageMap(res.Usage),
 		))
@@ -449,6 +747,52 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	textItemStarted := false
 	textOutputIdx := -1
 	var textBuf strings.Builder
+
+	thinkingItemStarted := false
+	thinkingItemID := ""
+	thinkingOutputIdx := -1
+	var thinkingBuf strings.Builder
+
+	ensureThinkingItem := func() {
+		if thinkingItemStarted {
+			return
+		}
+		ensureStarted()
+		thinkingItemStarted = true
+		thinkingItemID = "rs_" + strings.ReplaceAll(uuid(), "-", "")
+		thinkingOutputIdx = nextOutputIdx
+		nextOutputIdx++
+		writeSSE("response.output_item.added", map[string]any{
+			"output_index": thinkingOutputIdx,
+			"item": map[string]any{
+				"id":      thinkingItemID,
+				"type":    "reasoning",
+				"summary": []any{},
+			},
+		})
+		writeSSE("response.reasoning_summary_part.added", map[string]any{
+			"item_id":       thinkingItemID,
+			"output_index":  thinkingOutputIdx,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": ""},
+		})
+	}
+
+	closeThinkingItem := func() map[string]any {
+		full := thinkingBuf.String()
+		writeSSE("response.reasoning_summary_part.done", map[string]any{
+			"item_id":       thinkingItemID,
+			"output_index":  thinkingOutputIdx,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": full},
+		})
+		item := buildReasoningItem(thinkingItemID, full)
+		writeSSE("response.output_item.done", map[string]any{
+			"output_index": thinkingOutputIdx,
+			"item":         item,
+		})
+		return item
+	}
 
 	ensureTextItem := func() {
 		if textItemStarted {
@@ -519,7 +863,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		name      string
 		outputIdx int
 		args      string
+		custom    bool
 	}
+	customNames := customToolNames(bridgeDefs)
 	toolMap := make(map[string]*streamToolState)
 	var toolOrder []string
 	var bridgeBuffer strings.Builder
@@ -542,19 +888,26 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				callID:    tc.ID,
 				name:      tc.Name,
 				outputIdx: idx,
+				custom:    customNames[tc.Name],
 			}
 			toolMap[tc.ID] = st
 			toolOrder = append(toolOrder, tc.ID)
+			addedItem := map[string]any{
+				"id":        fcID,
+				"type":      "function_call",
+				"status":    "in_progress",
+				"call_id":   tc.ID,
+				"name":      tc.Name,
+				"arguments": "",
+			}
+			if st.custom {
+				addedItem["type"] = "custom_tool_call"
+				addedItem["input"] = ""
+				delete(addedItem, "arguments")
+			}
 			writeSSE("response.output_item.added", map[string]any{
 				"output_index": idx,
-				"item": map[string]any{
-					"id":        fcID,
-					"type":      "function_call",
-					"status":    "in_progress",
-					"call_id":   tc.ID,
-					"name":      tc.Name,
-					"arguments": "",
-				},
+				"item":         addedItem,
 			})
 		}
 		args := strings.TrimSpace(tc.Arguments)
@@ -566,7 +919,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			delta = args[len(st.args):]
 		}
 		st.args = args
-		if delta != "" {
+		if delta != "" && !st.custom {
 			writeSSE("response.function_call_arguments.delta", map[string]any{
 				"item_id":      st.fcID,
 				"output_index": st.outputIdx,
@@ -577,8 +930,28 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	var res ChatResult
 	var lastErr error
+	var usedAccount *store.Account
+	pinnedFirst := resume && conv.accountID != 0
+	var preferredAccount int64
 	for range s.maxAttempts() {
-		acct, err := s.accounts.Next(ctx)
+		var acct *store.Account
+		var err error
+		if pinnedFirst || preferredAccount != 0 {
+			accountID := preferredAccount
+			preferredAccount = 0
+			if pinnedFirst {
+				accountID = conv.accountID
+				pinnedFirst = false
+			}
+			acct, err = s.accounts.NextPinned(ctx, accountID)
+			if err != nil {
+				log.Printf("responses %s preferred account %d unavailable; selecting another account", respID, accountID)
+				resetConversation()
+				acct, err = s.accounts.Next(ctx)
+			}
+		} else {
+			acct, err = s.accounts.Next(ctx)
+		}
 		if err != nil {
 			lastErr = err
 			break
@@ -587,10 +960,25 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if err := sess.validate(); err != nil {
 			s.accounts.ReportFailure(ctx, acct.ID, err)
 			lastErr = err
+			if resume {
+				resetConversation()
+			}
 			continue
 		}
-		res, err = s.chat(ctx, sess, in, func(ev StreamEvent) error {
+		res, err = s.chatChunked(ctx, sess, in, func(ev StreamEvent) error {
 			switch ev.Type {
+			case "thinking":
+				if ev.Text == "" {
+					return nil
+				}
+				ensureThinkingItem()
+				thinkingBuf.WriteString(ev.Text)
+				writeSSE("response.reasoning_summary_text.delta", map[string]any{
+					"item_id":       thinkingItemID,
+					"output_index":  thinkingOutputIdx,
+					"summary_index": 0,
+					"delta":         ev.Text,
+				})
 			case "text":
 				if ev.Text == "" {
 					return nil
@@ -619,12 +1007,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		})
 		if err == nil {
 			lastErr = nil
+			usedAccount = acct
 			break
 		}
 		lastErr = err
 		s.accounts.ReportFailure(ctx, acct.ID, err)
 		if started || ctx.Err() != nil {
 			break
+		}
+		wasResume := resume
+		thinkingBuf.Reset()
+		resetConversation()
+		if wasResume {
+			preferredAccount = acct.ID
+			log.Printf("responses %s session resume failed; retrying with full transcript", respID)
 		}
 		// 尚未輸出給客戶端前可安全重置並換號重試。
 		nextOutputIdx = 0
@@ -637,6 +1033,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if lastErr != nil {
+		conv.reset()
 		if !started {
 			status, code := http.StatusBadGateway, "upstream_error"
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
@@ -651,12 +1048,18 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	rememberConversation(usedAccount, res)
 
 	var completedItems []map[string]any
+	if thinkingItemStarted {
+		closeThinkingItem()
+		completedItems = append(completedItems, buildReasoningItem(thinkingItemID, thinkingBuf.String()))
+	}
 	if bridgeActive {
 		var rerr error
 		text, toolCalls, rerr := resolveToolCalls(ChatResult{Text: bridgeBuffer.String(), ToolCalls: res.ToolCalls}, bridgeAllowed, choiceMode, choiceName, parallelTools)
 		if rerr != nil {
+			conv.reset()
 			code := "upstream_error"
 			if errors.Is(rerr, errToolMarker) {
 				code = "invalid_tool_call"
@@ -668,6 +1071,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			writeSSE("error", map[string]any{"code": code, "message": rerr.Error()})
 			return
 		}
+		markCustomCalls(toolCalls, customToolNames(bridgeDefs))
+		toolCalls = applyToolOrigins(toolCalls, toolOrigins)
+		text, decisionCalls := extractDecisionCalls(text, decisionAllowed)
+		toolCalls = append(toolCalls, decisionCalls...)
 		replies := toolCalls
 		if strings.TrimSpace(text) == "" && len(replies) == 0 {
 			if !started {
@@ -700,16 +1107,59 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			if args == "" {
 				args = "{}"
 			}
+			if tc.Custom {
+				input := customToolInput(args)
+				addedItem := map[string]any{
+					"id":      fcID,
+					"type":    "custom_tool_call",
+					"status":  "in_progress",
+					"call_id": tc.ID,
+					"name":    tc.Function.Name,
+					"input":   "",
+				}
+				if tc.Namespace != "" {
+					addedItem["namespace"] = tc.Namespace
+				}
+				writeSSE("response.output_item.added", map[string]any{"output_index": idx, "item": addedItem})
+				writeSSE("response.custom_tool_call_input.delta", map[string]any{
+					"item_id":      fcID,
+					"output_index": idx,
+					"delta":        input,
+				})
+				writeSSE("response.custom_tool_call_input.done", map[string]any{
+					"item_id":      fcID,
+					"output_index": idx,
+					"input":        input,
+				})
+				doneItem := map[string]any{
+					"id":      fcID,
+					"type":    "custom_tool_call",
+					"status":  "completed",
+					"call_id": tc.ID,
+					"name":    tc.Function.Name,
+					"input":   input,
+				}
+				if tc.Namespace != "" {
+					doneItem["namespace"] = tc.Namespace
+				}
+				writeSSE("response.output_item.done", map[string]any{"output_index": idx, "item": doneItem})
+				completedItems = append(completedItems, doneItem)
+				continue
+			}
+			addedItem := map[string]any{
+				"id":        fcID,
+				"type":      "function_call",
+				"status":    "in_progress",
+				"call_id":   tc.ID,
+				"name":      tc.Function.Name,
+				"arguments": "",
+			}
+			if tc.Namespace != "" {
+				addedItem["namespace"] = tc.Namespace
+			}
 			writeSSE("response.output_item.added", map[string]any{
 				"output_index": idx,
-				"item": map[string]any{
-					"id":        fcID,
-					"type":      "function_call",
-					"status":    "in_progress",
-					"call_id":   tc.ID,
-					"name":      tc.Function.Name,
-					"arguments": "",
-				},
+				"item":         addedItem,
 			})
 			writeSSE("response.function_call_arguments.delta", map[string]any{
 				"item_id":      fcID,
@@ -728,6 +1178,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				"call_id":   tc.ID,
 				"name":      tc.Function.Name,
 				"arguments": args,
+			}
+			if tc.Namespace != "" {
+				fcItem["namespace"] = tc.Namespace
 			}
 			writeSSE("response.output_item.done", map[string]any{
 				"output_index": idx,
@@ -752,6 +1205,33 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, id := range toolOrder {
 			st := toolMap[id]
+			if st.custom {
+				input := customToolInput(st.args)
+				writeSSE("response.custom_tool_call_input.delta", map[string]any{
+					"item_id":      st.fcID,
+					"output_index": st.outputIdx,
+					"delta":        input,
+				})
+				writeSSE("response.custom_tool_call_input.done", map[string]any{
+					"item_id":      st.fcID,
+					"output_index": st.outputIdx,
+					"input":        input,
+				})
+				item := map[string]any{
+					"id":      st.fcID,
+					"type":    "custom_tool_call",
+					"status":  "completed",
+					"call_id": st.callID,
+					"name":    st.name,
+					"input":   input,
+				}
+				writeSSE("response.output_item.done", map[string]any{
+					"output_index": st.outputIdx,
+					"item":         item,
+				})
+				completedItems = append(completedItems, item)
+				continue
+			}
 			writeSSE("response.function_call_arguments.done", map[string]any{
 				"item_id":      st.fcID,
 				"output_index": st.outputIdx,

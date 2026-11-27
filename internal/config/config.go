@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -83,6 +84,8 @@ type Config struct {
 	ChatAgentID      string   `json:"chat_agent_id"`
 	KeepSessions     bool     `json:"keep_sessions"`
 	SessionReuse     bool     `json:"session_reuse"`
+	NeutralPrompt    bool     `json:"neutral_prompt"`
+	NeutralToolLimit int      `json:"neutral_tool_limit"`
 	SessionTTL       Duration `json:"session_ttl"`
 	OAuth            OAuth    `json:"oauth"`
 	WebUI            WebUI    `json:"webui"`
@@ -99,22 +102,24 @@ type Config struct {
 // Default returns the built-in configuration.
 func Default() Config {
 	return Config{
-		Addr:           "127.0.0.1:8080",
-		Database:       "data/quickwork.db",
-		APIKeys:        []string{},
-		Models:         []string{"smart", "fast", "balanced", "auto"},
-		DefaultModel:   "smart",
-		RequestTimeout: Duration(5 * time.Minute),
-		RefreshBefore:  Duration(10 * time.Minute),
-		MaxAttempts:    3,
-		AppVersion:     "1.2.4660",
-		Surface:        "QUICK_WORK_DESKTOP_WINDOWS",
-		Timezone:       "UTC",
-		Locale:         "en-US",
-		ThinkingEffort: "",
-		KeepSessions:   false,
-		SessionReuse:   true,
-		SessionTTL:     Duration(30 * time.Minute),
+		Addr:             "127.0.0.1:8080",
+		Database:         "data/quickwork.db",
+		APIKeys:          []string{},
+		Models:           []string{"smart", "fast", "balanced", "auto"},
+		DefaultModel:     "smart",
+		RequestTimeout:   Duration(5 * time.Minute),
+		RefreshBefore:    Duration(10 * time.Minute),
+		MaxAttempts:      3,
+		AppVersion:       "1.2.4660",
+		Surface:          "QUICK_WORK_DESKTOP_WINDOWS",
+		Timezone:         "UTC",
+		Locale:           "en-US",
+		ThinkingEffort:   "",
+		KeepSessions:     false,
+		SessionReuse:     true,
+		NeutralPrompt:    envEnabled("QUICKPROXY_NEUTRAL_PROMPT"),
+		NeutralToolLimit: envInt("QUICKPROXY_NEUTRAL_TOOL_LIMIT", 16),
+		SessionTTL:       Duration(30 * time.Minute),
 		OAuth: OAuth{
 			Provider:     "social",
 			BuildStage:   "prod",
@@ -311,4 +316,23 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("oauth.build_stage must be prod, beta, integ or dev")
 	}
 	return nil
+}
+
+// envEnabled reports whether an environment switch is set to a truthy value.
+func envEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// envInt reads a positive integer environment override.
+func envInt(name string, fallback int) int {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
